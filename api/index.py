@@ -2,6 +2,9 @@ from fastapi import FastAPI, UploadFile, File
 import json
 
 app = FastAPI()
+@app.get("/api")
+def read_root():
+    return {"status": "This API is Live"}
 
 def clean_coordinates(coords):
     if isinstance(coords, (list, tuple)):
