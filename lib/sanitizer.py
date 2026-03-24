@@ -1,436 +1,338 @@
-from __future__ import annotations
+from copy import deepcopy
+from typing import Any, Dict, List, Tuple
 
-import copy
-import math
-import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from lib.aliases import ALIASES
 
-from .aliases import (
-    ALIASES,
-    ALLOWED_FIELDS,
-    DISTR_OPTIONS,
-    PRACTICE_OPTIONS,
-    TARGET_SYS_OPTIONS,
-)
+ALLOWED_PROPERTIES = {
+    "polyName",
+    "plantStart",
+    "practice",
+    "targetSys",
+    "distr",
+    "numTrees",
+    "siteId",
+}
 
-Fix = Dict[str, Any]
+PRACTICE_VALUES = {
+    "tree-planting",
+    "direct-seeding",
+    "assisted-natural-regeneration",
+}
 
+TARGET_SYS_VALUES = {
+    "agroforest",
+    "natural-forest",
+    "mangrove",
+    "grassland",
+    "peatland",
+    "riparian-area-or-wetland",
+    "silvopasture",
+    "woodlot-or-plantation",
+    "urban-forest",
+}
 
-def sanitize_geojson(data: Any) -> Dict[str, Any]:
-    report: Dict[str, Any] = {
-        "summary": {
-            "input_features": 0,
-            "output_features": 0,
-            "dropped_features": 0,
-            "fixes_applied": 0,
-        },
-        "file_fixes": [],
-        "feature_reports": [],
-    }
-
-    if not isinstance(data, dict):
-        raise ValueError("Input must be a JSON object.")
-
-    if data.get("type") != "FeatureCollection":
-        report["file_fixes"].append(
-            _fix("file", "set_type", "Top-level type was set to 'FeatureCollection'.")
-        )
-
-    features = data.get("features")
-    if not isinstance(features, list):
-        report["file_fixes"].append(
-            _fix("file", "replace_features", "Top-level features was not a list; replaced with an empty list.")
-        )
-        features = []
-
-    cleaned_features: List[Dict[str, Any]] = []
-    report["summary"]["input_features"] = len(features)
-
-    for index, feature in enumerate(features):
-        cleaned, feature_report = sanitize_feature(feature, index)
-        report["feature_reports"].append(feature_report)
-        if cleaned is None:
-            report["summary"]["dropped_features"] += 1
-            continue
-        cleaned_features.append(cleaned)
-
-    sanitized = {
-        "type": "FeatureCollection",
-        "features": cleaned_features,
-    }
-
-    total_fixes = len(report["file_fixes"])
-    for item in report["feature_reports"]:
-        total_fixes += len(item.get("fixes", []))
-
-    report["summary"]["output_features"] = len(cleaned_features)
-    report["summary"]["fixes_applied"] = total_fixes
-    return {"sanitized": sanitized, "report": report}
+DISTR_VALUES = {
+    "single-line",
+    "partial",
+    "full",
+}
 
 
-def sanitize_feature(feature: Any, index: int) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    feature_report: Dict[str, Any] = {
-        "feature_index": index,
-        "status": "kept",
+def sanitize_geojson(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    report = {
+        "input_feature_count": 0,
+        "output_feature_count": 0,
+        "dropped_features": 0,
         "fixes": [],
     }
 
+    if not isinstance(data, dict):
+        raise ValueError("GeoJSON root must be an object")
+
+    if data.get("type") != "FeatureCollection":
+        report["fixes"].append("Root type was invalid; forced to FeatureCollection.")
+
+    raw_features = data.get("features", [])
+    if not isinstance(raw_features, list):
+        raw_features = []
+        report["fixes"].append("features was not an array; replaced with empty array.")
+
+    report["input_feature_count"] = len(raw_features)
+
+    cleaned_features = []
+    for idx, feature in enumerate(raw_features):
+        cleaned_feature, feature_fixes = sanitize_feature(feature, idx)
+        report["fixes"].extend(feature_fixes)
+        if cleaned_feature is None:
+            report["dropped_features"] += 1
+        else:
+            cleaned_features.append(cleaned_feature)
+
+    report["output_feature_count"] = len(cleaned_features)
+
+    return {
+        "type": "FeatureCollection",
+        "features": cleaned_features,
+    }, report
+
+
+def sanitize_feature(feature: Dict[str, Any], idx: int):
+    fixes = []
+
     if not isinstance(feature, dict):
-        feature_report["status"] = "dropped"
-        feature_report["fixes"].append(
-            _fix("feature", "drop", "Feature was not an object and was dropped.")
-        )
-        return None, feature_report
+        fixes.append(f"Feature {idx}: dropped because it is not an object.")
+        return None, fixes
 
-    if feature.get("type") != "Feature":
-        feature_report["fixes"].append(
-            _fix("feature", "set_type", "Feature type was normalized to 'Feature'.")
-        )
-
-    geometry, geometry_fixes = sanitize_geometry(feature.get("geometry"))
-    feature_report["fixes"].extend(geometry_fixes)
+    geometry, geometry_fixes = sanitize_geometry(feature.get("geometry"), idx)
+    fixes.extend(geometry_fixes)
     if geometry is None:
-        feature_report["status"] = "dropped"
-        feature_report["fixes"].append(
-            _fix("feature", "drop", "Feature was dropped because geometry was invalid after sanitization.")
-        )
-        return None, feature_report
+        fixes.append(f"Feature {idx}: dropped because geometry is invalid.")
+        return None, fixes
 
-    properties, property_fixes = sanitize_properties(feature.get("properties"))
-    feature_report["fixes"].extend(property_fixes)
+    properties, property_fixes = sanitize_properties(feature.get("properties", {}), idx)
+    fixes.extend(property_fixes)
 
-    cleaned = {
+    return {
         "type": "Feature",
         "geometry": geometry,
         "properties": properties,
-    }
-    return cleaned, feature_report
+    }, fixes
 
 
-def sanitize_geometry(geometry: Any) -> Tuple[Optional[Dict[str, Any]], List[Fix]]:
-    fixes: List[Fix] = []
+def sanitize_geometry(geometry: Dict[str, Any], idx: int):
+    fixes = []
+
     if not isinstance(geometry, dict):
-        fixes.append(_fix("geometry", "invalid", "Geometry was missing or not an object."))
+        fixes.append(f"Feature {idx}: geometry missing or invalid.")
         return None, fixes
 
-    geometry_type = geometry.get("type")
-    coordinates = geometry.get("coordinates")
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
 
-    if geometry_type == "Polygon":
-        cleaned = sanitize_polygon(coordinates)
-    elif geometry_type == "MultiPolygon":
-        cleaned = sanitize_multipolygon(coordinates)
-    else:
-        fixes.append(
-            _fix(
-                "geometry",
-                "unsupported_type",
-                f"Unsupported geometry type '{geometry_type}'. Only Polygon and MultiPolygon are supported.",
-            )
-        )
-        return None, fixes
+    if gtype == "Polygon":
+        cleaned = sanitize_polygon(coords, idx, fixes)
+        if cleaned is None:
+            return None, fixes
+        return {"type": "Polygon", "coordinates": cleaned}, fixes
 
-    if cleaned is None:
-        fixes.append(_fix("geometry", "invalid", "Geometry coordinates could not be repaired."))
-        return None, fixes
+    if gtype == "MultiPolygon":
+        cleaned = sanitize_multipolygon(coords, idx, fixes)
+        if cleaned is None:
+            return None, fixes
+        return {"type": "MultiPolygon", "coordinates": cleaned}, fixes
 
-    if _contains_z_values(coordinates):
-        fixes.append(_fix("geometry", "strip_z", "Removed extra coordinate dimensions and kept only 2D coordinates."))
-
-    if geometry_type == "Polygon" and _rings_were_auto_closed_polygon(coordinates, cleaned):
-        fixes.append(_fix("geometry", "close_ring", "Auto-closed one or more polygon rings."))
-    elif geometry_type == "MultiPolygon" and _rings_were_auto_closed_multipolygon(coordinates, cleaned):
-        fixes.append(_fix("geometry", "close_ring", "Auto-closed one or more polygon rings."))
-
-    return {"type": geometry_type, "coordinates": cleaned}, fixes
+    fixes.append(f"Feature {idx}: unsupported geometry type {gtype}; dropped.")
+    return None, fixes
 
 
-def sanitize_polygon(coords: Any) -> Optional[List[List[List[float]]]]:
+def sanitize_polygon(coords: Any, idx: int, fixes: List[str]):
     if not isinstance(coords, list) or not coords:
+        fixes.append(f"Feature {idx}: polygon coordinates invalid.")
         return None
 
-    cleaned_rings: List[List[List[float]]] = []
-    for ring in coords:
-        cleaned_ring = sanitize_ring(ring)
+    cleaned_rings = []
+    for ring_i, ring in enumerate(coords):
+        cleaned_ring = sanitize_ring(ring, idx, ring_i, fixes)
         if cleaned_ring is None:
-            return None
+            continue
         cleaned_rings.append(cleaned_ring)
+
+    if not cleaned_rings:
+        fixes.append(f"Feature {idx}: no valid polygon rings remained.")
+        return None
 
     return cleaned_rings
 
 
-def sanitize_multipolygon(coords: Any) -> Optional[List[List[List[List[float]]]]]:
+def sanitize_multipolygon(coords: Any, idx: int, fixes: List[str]):
     if not isinstance(coords, list) or not coords:
+        fixes.append(f"Feature {idx}: multipolygon coordinates invalid.")
         return None
 
-    cleaned_polygons: List[List[List[List[float]]]] = []
-    for polygon in coords:
-        cleaned_polygon = sanitize_polygon(polygon)
-        if cleaned_polygon is None:
-            return None
-        cleaned_polygons.append(cleaned_polygon)
+    cleaned_polygons = []
+    for poly_i, polygon in enumerate(coords):
+        if not isinstance(polygon, list):
+            fixes.append(f"Feature {idx}: polygon {poly_i} in multipolygon is invalid.")
+            continue
+
+        cleaned_rings = []
+        for ring_i, ring in enumerate(polygon):
+            cleaned_ring = sanitize_ring(ring, idx, ring_i, fixes)
+            if cleaned_ring is None:
+                continue
+            cleaned_rings.append(cleaned_ring)
+
+        if cleaned_rings:
+            cleaned_polygons.append(cleaned_rings)
+
+    if not cleaned_polygons:
+        fixes.append(f"Feature {idx}: no valid polygons remained in multipolygon.")
+        return None
+
     return cleaned_polygons
 
 
-def sanitize_ring(ring: Any) -> Optional[List[List[float]]]:
-    if not isinstance(ring, list) or len(ring) < 3:
+def sanitize_ring(ring: Any, idx: int, ring_i: int, fixes: List[str]):
+    if not isinstance(ring, list):
+        fixes.append(f"Feature {idx}: ring {ring_i} is invalid.")
         return None
 
-    cleaned_ring: List[List[float]] = []
+    cleaned = []
+    stripped_any_z = False
+
     for point in ring:
-        cleaned_point = sanitize_point(point)
-        if cleaned_point is None:
-            return None
-        cleaned_ring.append(cleaned_point)
+        if not isinstance(point, list) or len(point) < 2:
+            continue
 
-    if len(cleaned_ring) < 3:
+        x = point[0]
+        y = point[1]
+
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            continue
+
+        if len(point) > 2:
+            stripped_any_z = True
+
+        cleaned.append([x, y])
+
+    if stripped_any_z:
+        fixes.append(f"Feature {idx}: stripped Z values from ring {ring_i}.")
+
+    if len(cleaned) < 3:
+        fixes.append(f"Feature {idx}: ring {ring_i} has fewer than 3 valid points.")
         return None
 
-    if cleaned_ring[0] != cleaned_ring[-1]:
-        cleaned_ring.append(copy.deepcopy(cleaned_ring[0]))
+    if cleaned[0] != cleaned[-1]:
+        cleaned.append(deepcopy(cleaned[0]))
+        fixes.append(f"Feature {idx}: auto-closed ring {ring_i}.")
 
-    if len(cleaned_ring) < 4:
+    if len(cleaned) < 4:
+        fixes.append(f"Feature {idx}: ring {ring_i} invalid after closing.")
         return None
 
-    return cleaned_ring
+    return cleaned
 
 
-def sanitize_point(point: Any) -> Optional[List[float]]:
-    if not isinstance(point, list) or len(point) < 2:
-        return None
+def sanitize_properties(properties: Any, idx: int):
+    fixes = []
 
-    lon = _coerce_number(point[0])
-    lat = _coerce_number(point[1])
-    if lon is None or lat is None:
-        return None
-    return [_round_coord(lon), _round_coord(lat)]
-
-
-def sanitize_properties(properties: Any) -> Tuple[Dict[str, Any], List[Fix]]:
-    fixes: List[Fix] = []
-    source = properties if isinstance(properties, dict) else {}
     if not isinstance(properties, dict):
-        fixes.append(_fix("properties", "replace", "Properties was missing or not an object; replaced with an empty object."))
+        fixes.append(f"Feature {idx}: properties invalid; replaced with empty object.")
+        properties = {}
 
-    canonical: Dict[str, Any] = {}
-    seen_canonical: set[str] = set()
-
-    for key, value in source.items():
-        normalized_key = normalize_property_name(key)
-        if normalized_key != key:
-            fixes.append(_fix("properties", "rename", f"Mapped property '{key}' to '{normalized_key}'."))
-
-        if normalized_key not in ALLOWED_FIELDS:
-            fixes.append(_fix("properties", "remove", f"Removed unsupported property '{key}'."))
+    normalized = {}
+    for key, value in properties.items():
+        canonical = canonical_property_name(key)
+        if canonical is None:
+            fixes.append(f"Feature {idx}: removed unsupported property '{key}'.")
             continue
+        if canonical != key:
+            fixes.append(f"Feature {idx}: mapped property '{key}' to '{canonical}'.")
+        normalized[canonical] = value
 
-        if normalized_key in seen_canonical:
-            fixes.append(_fix("properties", "dedupe", f"Dropped duplicate property '{key}' after normalization."))
-            continue
+    result = {key: None for key in ALLOWED_PROPERTIES}
 
-        canonical[normalized_key] = value
-        seen_canonical.add(normalized_key)
+    if "polyName" in normalized:
+        result["polyName"] = normalized["polyName"] if isinstance(normalized["polyName"], str) else None
+        if normalized["polyName"] is not None and result["polyName"] is None:
+            fixes.append(f"Feature {idx}: set invalid polyName to null.")
 
-    cleaned = {field: None for field in sorted(ALLOWED_FIELDS)}
+    if "plantStart" in normalized:
+        value = normalized["plantStart"]
+        result["plantStart"] = value if is_valid_date_string(value) else None
+        if value is not None and result["plantStart"] is None:
+            fixes.append(f"Feature {idx}: set invalid plantStart to null.")
 
-    if "polyName" in canonical:
-        cleaned["polyName"] = _sanitize_string(canonical["polyName"])
-        if canonical["polyName"] is not None and cleaned["polyName"] is None:
-            fixes.append(_fix("properties", "nullify", "Set invalid polyName to null."))
+    if "practice" in normalized:
+        cleaned = normalize_enum_field(normalized["practice"], PRACTICE_VALUES)
+        result["practice"] = cleaned
+        if cleaned is None and normalized["practice"] is not None:
+            fixes.append(f"Feature {idx}: set invalid practice to null.")
 
-    if "plantStart" in canonical:
-        cleaned["plantStart"] = _sanitize_date(canonical["plantStart"])
-        if canonical["plantStart"] not in (None, "") and cleaned["plantStart"] is None:
-            fixes.append(_fix("properties", "nullify", "Set invalid plantStart to null."))
+    if "targetSys" in normalized:
+        value = normalized["targetSys"]
+        result["targetSys"] = value if isinstance(value, str) and value in TARGET_SYS_VALUES else None
+        if value is not None and result["targetSys"] is None:
+            fixes.append(f"Feature {idx}: set invalid targetSys to null.")
 
-    if "practice" in canonical:
-        value, changed = _sanitize_enum_field(canonical["practice"], PRACTICE_OPTIONS)
-        cleaned["practice"] = value
-        if changed:
-            fixes.append(_fix("properties", "normalize", "Normalized practice and set invalid values to null."))
+    if "distr" in normalized:
+        cleaned = normalize_enum_field(normalized["distr"], DISTR_VALUES)
+        result["distr"] = cleaned
+        if cleaned is None and normalized["distr"] is not None:
+            fixes.append(f"Feature {idx}: set invalid distr to null.")
 
-    if "targetSys" in canonical:
-        value = _sanitize_enum_scalar(canonical["targetSys"], TARGET_SYS_OPTIONS)
-        cleaned["targetSys"] = value
-        if canonical["targetSys"] not in (None, value):
-            if value is None:
-                fixes.append(_fix("properties", "nullify", "Set invalid targetSys to null."))
-            else:
-                fixes.append(_fix("properties", "normalize", "Normalized targetSys."))
+    if "numTrees" in normalized:
+        result["numTrees"] = normalize_number_or_null(normalized["numTrees"])
+        if normalized["numTrees"] not in (None, "", result["numTrees"]):
+            fixes.append(f"Feature {idx}: normalized invalid numTrees to null.")
 
-    if "distr" in canonical:
-        value, changed = _sanitize_enum_field(canonical["distr"], DISTR_OPTIONS)
-        cleaned["distr"] = value
-        if changed:
-            fixes.append(_fix("properties", "normalize", "Normalized distr and set invalid values to null."))
+    if "siteId" in normalized:
+        value = normalized["siteId"]
+        if value is None or value == "":
+            result["siteId"] = None
+        else:
+            result["siteId"] = str(value)
 
-    if "numTrees" in canonical:
-        value = _sanitize_num_trees(canonical["numTrees"])
-        cleaned["numTrees"] = value
-        if canonical["numTrees"] not in (None, "", value):
-            if value is None:
-                fixes.append(_fix("properties", "nullify", "Set invalid numTrees to null."))
-            else:
-                fixes.append(_fix("properties", "normalize", "Normalized numTrees."))
-
-    if "siteId" in canonical:
-        cleaned["siteId"] = _sanitize_site_id(canonical["siteId"])
-        if canonical["siteId"] not in (None, cleaned["siteId"]):
-            if cleaned["siteId"] is None:
-                fixes.append(_fix("properties", "nullify", "Set invalid siteId to null."))
-            else:
-                fixes.append(_fix("properties", "normalize", "Normalized siteId."))
-
-    return cleaned, fixes
+    return result, fixes
 
 
-def normalize_property_name(name: str) -> str:
-    if name in ALLOWED_FIELDS:
-        return name
-    lowered = str(name).strip()
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", lowered).strip("_")
-    compact = re.sub(r"[^A-Za-z0-9]+", "", lowered)
-    return (
-        ALIASES.get(name)
-        or ALIASES.get(lowered)
-        or ALIASES.get(slug)
-        or ALIASES.get(compact.lower())
-        or name
-    )
+def canonical_property_name(key: Any):
+    if not isinstance(key, str):
+        return None
+
+    if key in ALLOWED_PROPERTIES:
+        return key
+
+    squeezed = key.replace("-", "").replace("_", "").replace(" ", "")
+    return ALIASES.get(key) or ALIASES.get(squeezed.lower())
 
 
-def _sanitize_enum_field(value: Any, allowed: set[str]) -> Tuple[Optional[Any], bool]:
+def normalize_enum_field(value: Any, allowed: set):
     if value is None or value == "":
-        return None, value not in (None,)
+        return None
+
+    if isinstance(value, str):
+        return value if value in allowed else None
 
     if isinstance(value, list):
-        cleaned_list: List[str] = []
-        changed = False
-        for item in value:
-            normalized = _sanitize_enum_scalar(item, allowed)
-            if normalized is None:
-                changed = True
-                continue
-            cleaned_list.append(normalized)
-        cleaned_list = list(dict.fromkeys(cleaned_list))
-        if not cleaned_list:
-            return None, True
-        if len(cleaned_list) == 1:
-            return cleaned_list[0], True
-        return cleaned_list, changed
+        valid = [item for item in value if isinstance(item, str) and item in allowed]
+        if not valid:
+            return None
+        if len(valid) == 1:
+            return valid[0]
+        return valid
 
-    normalized = _sanitize_enum_scalar(value, allowed)
-    if normalized is None:
-        return None, True
-    return normalized, normalized != value
-
-
-def _sanitize_enum_scalar(value: Any, allowed: set[str]) -> Optional[str]:
-    if value is None:
-        return None
-    text = _sanitize_string(value)
-    if text is None:
-        return None
-    if text in allowed:
-        return text
     return None
 
 
-def _sanitize_num_trees(value: Any) -> Optional[int]:
-    if value in (None, ""):
-        return None
-    number = _coerce_number(value)
-    if number is None:
-        return None
-    if math.isnan(number) or math.isinf(number):
-        return None
-    return int(number) if float(number).is_integer() else round(number, 2)
-
-
-def _sanitize_site_id(value: Any) -> Optional[str]:
-    text = _sanitize_string(value)
-    return text
-
-
-def _sanitize_string(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        text = str(value)
-    else:
-        return None
-    return text or None
-
-
-def _sanitize_date(value: Any) -> Optional[str]:
-    text = _sanitize_string(value)
-    if text is None:
-        return None
-    try:
-        datetime.strptime(text, "%Y-%m-%d")
-        return text
-    except ValueError:
+def normalize_number_or_null(value: Any):
+    if value is None or value == "":
         return None
 
-
-def _coerce_number(value: Any) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return value
+
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
         try:
-            return float(text)
+            if "." in value:
+                return float(value)
+            return int(value)
         except ValueError:
             return None
+
     return None
 
 
-def _round_coord(value: float) -> float:
-    return round(float(value), 9)
-
-
-def _contains_z_values(coords: Any) -> bool:
-    if isinstance(coords, list):
-        if len(coords) >= 3 and all(not isinstance(item, list) for item in coords[:3]):
-            return True
-        return any(_contains_z_values(item) for item in coords)
-    return False
-
-
-def _rings_were_auto_closed_polygon(original: Any, cleaned: Any) -> bool:
-    if not isinstance(original, list) or not isinstance(cleaned, list):
+def is_valid_date_string(value: Any):
+    if not isinstance(value, str):
         return False
-    for original_ring, cleaned_ring in zip(original, cleaned):
-        if _ring_was_auto_closed(original_ring, cleaned_ring):
-            return True
-    return False
 
-
-def _rings_were_auto_closed_multipolygon(original: Any, cleaned: Any) -> bool:
-    if not isinstance(original, list) or not isinstance(cleaned, list):
+    parts = value.split("-")
+    if len(parts) != 3:
         return False
-    for original_polygon, cleaned_polygon in zip(original, cleaned):
-        if _rings_were_auto_closed_polygon(original_polygon, cleaned_polygon):
-            return True
-    return False
 
-
-def _ring_was_auto_closed(original_ring: Any, cleaned_ring: Any) -> bool:
-    if not isinstance(original_ring, list) or not original_ring:
+    y, m, d = parts
+    if len(y) != 4 or len(m) != 2 or len(d) != 2:
         return False
-    if not isinstance(cleaned_ring, list) or not cleaned_ring:
-        return False
-    original_first = sanitize_point(original_ring[0]) if isinstance(original_ring[0], list) else None
-    original_last = sanitize_point(original_ring[-1]) if isinstance(original_ring[-1], list) else None
-    return original_first is not None and original_last is not None and original_first != original_last and cleaned_ring[0] == cleaned_ring[-1]
 
-
-def _fix(scope: str, code: str, message: str) -> Fix:
-    return {"scope": scope, "code": code, "message": message}
+    return y.isdigit() and m.isdigit() and d.isdigit()
