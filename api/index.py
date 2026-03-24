@@ -1,44 +1,41 @@
-from __future__ import annotations
-
-import json
-from typing import Any
-
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+import json
 
 from lib.sanitizer import sanitize_geojson
 
-app = FastAPI(title="GeoJSON Sanitizer API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/sanitize")
+def sanitize_help():
+    return {
+        "message": "Use POST with multipart/form-data and a file field named 'file'."
+    }
 
 
 @app.post("/api/sanitize")
-async def sanitize(file: UploadFile = File(...)) -> JSONResponse:
-    if not file.filename.lower().endswith((".json", ".geojson")):
-        raise HTTPException(status_code=400, detail="Please upload a .json or .geojson file.")
-
-    raw = await file.read()
+async def sanitize(file: UploadFile = File(...)):
     try:
-        payload: Any = json.loads(raw.decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail="Uploaded file is not valid UTF-8 JSON.") from exc
+        raw = await file.read()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {exc}")
 
     try:
-        result = sanitize_geojson(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        sanitized, report = sanitize_geojson(data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Sanitization failed: {exc}")
 
-    return JSONResponse(result)
+    return JSONResponse(
+        content={
+            "filename": file.filename,
+            "sanitized": sanitized,
+            "report": report,
+        }
+    )
