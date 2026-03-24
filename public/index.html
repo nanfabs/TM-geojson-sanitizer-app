@@ -16,10 +16,12 @@
       border: 1px solid #ddd;
       border-radius: 8px;
       padding: 20px;
+      margin-bottom: 20px;
     }
     button {
       padding: 10px 16px;
       cursor: pointer;
+      margin-right: 8px;
     }
     pre {
       background: #f6f6f6;
@@ -29,25 +31,49 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .hidden {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <h1>GeoJSON Sanitizer</h1>
+
   <div class="card">
     <p>Upload a GeoJSON file to sanitize it.</p>
     <input id="fileInput" type="file" accept=".json,.geojson,application/geo+json,application/json">
     <button id="uploadBtn">Sanitize</button>
+    <button id="downloadBtn" class="hidden">Download sanitized GeoJSON</button>
     <p id="status"></p>
   </div>
 
-  <h2>Result</h2>
-  <pre id="output">No result yet.</pre>
+  <div class="card">
+    <h2>Result</h2>
+    <pre id="output">No result yet.</pre>
+  </div>
 
   <script>
     const fileInput = document.getElementById("fileInput");
     const uploadBtn = document.getElementById("uploadBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
     const statusEl = document.getElementById("status");
     const outputEl = document.getElementById("output");
+
+    let sanitizedGeojson = null;
+    let originalFilename = "sanitized.geojson";
+
+    function buildDownloadFilename(filename) {
+      if (!filename) return "sanitized.geojson";
+
+      const lower = filename.toLowerCase();
+      if (lower.endsWith(".geojson")) {
+        return filename.replace(/\.geojson$/i, ".sanitized.geojson");
+      }
+      if (lower.endsWith(".json")) {
+        return filename.replace(/\.json$/i, ".sanitized.geojson");
+      }
+      return filename + ".sanitized.geojson";
+    }
 
     uploadBtn.addEventListener("click", async () => {
       const file = fileInput.files[0];
@@ -55,6 +81,10 @@
         statusEl.textContent = "Please choose a file first.";
         return;
       }
+
+      sanitizedGeojson = null;
+      originalFilename = buildDownloadFilename(file.name);
+      downloadBtn.classList.add("hidden");
 
       statusEl.textContent = "Uploading...";
       outputEl.textContent = "Working...";
@@ -76,12 +106,32 @@
           return;
         }
 
+        sanitizedGeojson = data.sanitized;
         outputEl.textContent = JSON.stringify(data, null, 2);
         statusEl.textContent = "Done.";
+        downloadBtn.classList.remove("hidden");
       } catch (err) {
         outputEl.textContent = String(err);
         statusEl.textContent = "Upload failed.";
       }
+    });
+
+    downloadBtn.addEventListener("click", () => {
+      if (!sanitizedGeojson) return;
+
+      const blob = new Blob(
+        [JSON.stringify(sanitizedGeojson, null, 2)],
+        { type: "application/geo+json" }
+      );
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = originalFilename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     });
   </script>
 </body>
